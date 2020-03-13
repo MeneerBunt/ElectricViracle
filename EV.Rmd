@@ -1,0 +1,319 @@
+---
+title: "Elaad"
+author: "Marco Bunt"
+date: "19-2-2020"
+output: html_document
+---
+This is about simulating the efect on the network due to electic viracles. Same things can be done with e.g. trucs.
+
+Elaad data is both BEV and PHEV. To simulate one of both, aditional imput is needed.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include = T)
+
+LoadPackages <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+LoadPackages(c( "readxl","dplyr", "tidyr", "ggplot2", "pbapply", "parallel" ))
+
+n.c <- detectCores()
+```
+
+# Data input
+https://platform.elaad.io/analyses/ElaadNL_opendata_2018_11.php
+
+```{r elaad arival prob}
+
+arrival <- 
+  bind_rows(
+    # weekday
+    read_excel('../data/modeldata/manual/Elaad/arrival.weekday.xlsx') %>%
+      rename(arrival.time = 'Arrival time') %>% 
+      gather("type", "arival.prob", -arrival.time) %>%
+      mutate( weekday = T,
+              hour = as.numeric(format(arrival.time, "%H")) +1 ),
+    # weekends
+    read_excel('../data/modeldata/manual/Elaad/arrival.weekend.xlsx') %>%
+      rename(arrival.time = 'Arrival time') %>% 
+      gather("type", "arival.prob", -arrival.time) %>%
+      mutate( weekday = F,
+              hour = as.numeric(format(arrival.time, "%H")) +1 )) %>%
+  select(-arrival.time)
+
+demand <- read_excel('../data/modeldata/manual/Elaad/demand.xlsx') %>%
+  rename(kWh = "Energy demand per charging event (kWh)") %>%
+  gather("type", "value", -kWh) %>% mutate(value = as.numeric(value))
+
+duration <-  read_excel('../data/modeldata/manual/Elaad/duration.xlsx') %>%
+  rename(time = "Connection duration per charging event (hours)") %>%
+  gather("type", "value", -time) %>% mutate(value = as.numeric(value))
+
+piek <- read_excel('../data/modeldata/manual/Elaad/piek.xlsx') %>%
+  rename(prec = "Percentage of charging events") %>%
+  gather("type", "piek.prob", -prec) %>% mutate(piek.prob = as.numeric(piek.prob)) %>%
+  filter(type == max(type))
+
+```
+
+```{r elaad arival PLOT, include=T}
+
+arrival %>% ggplot(aes(hour, arival.prob, col = type)) + geom_line() + facet_wrap(~weekday)
+
+```
+
+
+# Functions
+First step ios to create a time series that represent all the dates for te sumulation.
+
+```{r create time serie }
+
+create.timeserie <- function(start = Sys.Date(), 
+                             lengt = 7, 
+                             sesonal.dif = 0){
+  
+  time.serie <-  data.frame( time = seq.POSIXt(as.POSIXct(start), as.POSIXct(Sys.Date()+lengt), by = "1 hour")) %>%
+    mutate( arrive.day = strftime(time, format = "%j"),
+            arrive.year = strftime(time, format = "%Y"),
+            weekday = ifelse(weekdays(time) %in% c("zaterdag", "zondag"), F, T),
+            maand.fact = ifelse( strftime(time, format = "%m") %in% c("12", "01", "02", "03"), 1 + sesonal.dif, 1),
+            maand.fact = ifelse( strftime(time, format = "%m") %in% c("06", "06", "07", "08"), 1 - sesonal.dif, maand.fact),
+            charge.day = T) %>%
+    group_by(arrive.day) %>% ungroup() %>%
+    group_by(arrive.day) %>% filter(n() == 24) %>% ungroup() 
+  
+  if ( length(time.serie) == 0){warning("retun empty time.serie, minimus lenth is 1 full day")}
+  
+  return(
+    time.serie
+  )
+  
+  
+  
+}
+
+time.serie <- create.timeserie(start = Sys.Date(), lengt = 7)
+```
+
+```{r plot time serie, include=T}
+head(time.serie)
+```
+
+We create a code that simulates arivals of cars.
+```{r simutate arivals}
+
+create.arrival.table <- function(number.of.cars = 1:2, time.serie, arrival, demand, laad.piek = 10:11, n.chargings.perday = 1,
+                                 charging.point.type = "Private"){
+  
+  if ( length(laad.piek) == 1){ laad.piek <- rep(laad.piek, 2) } # if one unique number is given, sample does not work correct. This is the fix
+  
+  tb <- lapply(number.of.cars, function(n.cars){
+    data.frame(stringsAsFactors = F,
+               car.id = as.character( sample(10^6:10^7, n.cars)),
+               laad.piek = sample(laad.piek, n.cars, replace = T),#piek %>% ungroup() %>% sample_n(1) %>% pull(piek.prob),
+               charge.day = T) %>%
+      left_join(time.serie, by = "charge.day") %>% mutate(transaction = paste(car.id, arrive.day, arrive.year)) %>%
+      left_join(arrival, by = "weekday") %>% select(-weekday) %>% filter(type == charging.point.type) %>%
+      
+      group_by(car.id, arrive.year, arrive.day, maand.fact) %>% sample_n(size = 1, weight = arival.prob) %>%
+      group_by(transaction) %>%
+      mutate( kwh = sample(x = demand %>% filter(type == charging.point.type) %>% sample_n(7, weight = value ) %>% pull(kWh),size = 1, 
+                           prob = demand %>% filter(type == charging.point.type) %>% sample_n(7, weight = value ) %>% pull(value)),
+              kwh = kwh * maand.fact,
+              time.charge = ceiling(kwh/laad.piek),
+              n.cars = n.cars) %>%
+      select(car.id, transaction, time, kwh, laad.piek, time.charge, n.cars)
+  }) %>% do.call(bind_rows, .)
+  
+  return(tb)
+}
+
+arival.demand <- create.arrival.table(number.of.cars = 1:2, demand = demand, time.serie = time.serie, arrival = arrival)
+```
+
+```{r plor demand, include=T}
+head(arival.demand)
+```
+
+```{r load patrn}
+
+n.car.station.load <- function(tbl, time.serie){
+  
+  out <- lapply( 1:nrow(tbl), function(i){
+    data.frame(stringsAsFactors = F,
+               car.id = tbl$car.id[i],
+               time = seq.POSIXt( 
+                 tbl$time[i], tbl$time[i]+(tbl$time.charge[i] * 60*60), by = "1 hour"),
+               laad.piek = tbl$laad.piek[i],
+               kwh = tbl$kwh[i],
+               laad.id = tbl$transaction[i],
+               n.cars = tbl$n.cars[i]) %>%
+      arrange(time) %>%
+      
+      mutate(charged = cumsum(laad.piek),
+             rest = kwh - lag(charged)) %>%
+      group_by(time) %>%
+      mutate(kw = max(0,min(laad.piek, rest, na.rm = T))) %>% ungroup() %>% 
+      select(car.id, time, kw, n.cars, laad.piek)
+    
+  } ) %>% do.call(bind_rows, .) %>%
+    group_by(car.id, time, n.cars, laad.piek) %>% summarise(kw = sum(kw))  %>% 
+    mutate(kw = ifelse(kw > laad.piek, laad.piek, kw)) %>%
+    select(-laad.piek) %>%
+    
+    group_by(car.id) %>%
+    complete(time = time.serie$time) %>% 
+    mutate(kw = ifelse(is.na(kw), 0, kw)) %>% 
+    
+    group_by(car.id) %>%
+    fill(n.cars) %>%
+    fill(n.cars, .direction = "up") %>% filter(!is.na(n.cars)) %>% 
+    distinct() 
+  
+  return(out)
+}
+
+elaad.load <- n.car.station.load(tbl = arival.demand, time.serie = time.serie)
+```
+
+```{r plotload patrn, include=T}
+head(elaad.load, n = 72)
+```
+
+```{r load profiels}
+laad.patroon <- function(
+  number.of.cars = 5, # model simulate te difference on net impact, given the number of cars in the grid
+  arrival.tbl = arrival,
+  demand.tbl = demand,  
+  start.date = Sys.Date(), # date to start the simulation
+  lengt.out = 7, # numbers of days to be calculated.
+  kw.piek = 11, # the piek that cars use to charge
+  sesonal.dif = 0, # is the loading in the winter higher that in the summer?
+  charging.point.type = "Private",
+  laadconcepten = "normaal", #this can be used if we make difernd concepts 
+  
+  create.profiles = T
+  
+){
+  
+  time.serie <- create.timeserie(start.date, lengt.out, sesonal.dif = sesonal.dif )
+  
+  arival.demand <- create.arrival.table(number.of.cars = number.of.cars, time.serie = time.serie, demand = demand.tbl, 
+                                        arrival = arrival.tbl, laad.piek = kw.piek, n.chargings.perday = 1)
+  
+  elaad.load <- n.car.station.load(tbl = arival.demand, time.serie = time.serie)
+  
+  if ( create.profiles == T){ # create profiles as an output
+    if (length(number.of.cars) > 1){stop(" creating profiels for a serie of variating cars, choose 1 unique number of cars to create profiles") }
+    return( elaad.load %>% group_by(car.id, time) %>% summarise(kw = sum(kw, na.rm = T) ) ) }
+  
+  else( # create max profiles as an output
+    return( elaad.load %>% group_by(car.id,n.cars, time) %>% summarise(kw = sum(kw, na.rm = T) ) ) 
+    
+  )
+}
+
+```
+
+```{r plot time serie piek, echo=F, include=T}
+
+aantal.auto <- c(1, 2, 20)
+laad.piek <- c(5, 10, 15)
+for (n.car in aantal.auto){
+  i <- lapply(laad.piek, function(kw.piek){
+    laad.patroon(number.of.cars = n.car, demand.tbl = demand, lengt.out = 7, kw.piek = kw.piek) %>% 
+      mutate(kw.piek = paste("kw.piek charging: ", kw.piek, " kw") ) }) %>% do.call(bind_rows, .) %>%
+    group_by(time, kw.piek) %>% mutate(sum = sum(kw)) %>%
+    group_by(kw.piek) %>% mutate(max = max(sum))
+  
+  plot( i %>% ggplot(aes(x = time, y = kw, fill = car.id)) + 
+          geom_area(stat ="identity", alpha=0.6) + theme(legend.position="none") +
+          geom_hline(data=i, aes(yintercept=max), col="salmon") +
+          labs(title = "Piekvraag per aantal auto's", subtitle = paste("n.car = ",n.car, sep = " ") ) +
+          facet_wrap(~kw.piek, ncol = 4) ) 
+}
+
+```
+
+# Monte carlo
+```{r monte carlo piekvraag}
+aantal.simulatie <- 100^3
+aantal.auto <-  floor(10^(0.2*1:10) )
+laad.piek <- floor(seq(2, 30, length.out = 7))
+charging.point.type <- "Private"
+gc()
+
+cl <- makePSOCKcluster(n.c)
+clusterExport(cl, c( "laad.patroon","demand", "arrival", "aantal.auto", "laad.piek", "makePSOCKcluster", "clusterExport",
+                     "create.arrival.table",  "n.c", "pblapply",
+                     # own function
+                     "n.car.station.load","create.timeserie",
+                     
+                     # dplyr
+                     "left_join", "arrange","filter", "sample_n", "pull", "bind_rows", "select","summarise", "%>%",
+                     "mutate", "group_by", "ungroup","distinct",
+                     # tidyr
+                     "complete","fill","n",
+                     "charging.point.type", "time.serie"), envir=environment())
+
+m.c <- pblapply(cl = cl, 1:aantal.simulatie, function(i){
+  lapply(laad.piek, function(lp){
+    laad.patroon(number.of.cars = aantal.auto, demand.tbl = demand, lengt.out = 7, kw.piek = lp, create.profiles = F) %>%
+      mutate(kw.piek = lp) %>%
+      group_by(n.cars, kw.piek, time) %>% 
+      summarise( kw.sum = sum( kw )) %>%
+      group_by(n.cars, kw.piek ) %>%
+      summarise( kw.sum.piek = max( kw.sum ) )
+  }) %>% do.call(bind_rows, .)
+}) %>% do.call(bind_rows, .)
+save(m.c, file = "../private/elaad.mc.Rdata")
+stopCluster(cl)
+gc()
+```
+
+```{r}
+
+
+m.c %>% filter(n.cars > 10) %>%
+  mutate( value = kw.sum.piek/ n.cars ) %>%
+  group_by(n.cars, kw.piek) %>%
+  summarise(
+    quant99 = quantile(value, 0.99),
+    max = max(value),
+    mean = round(mean(value),2),
+    sd = round(sd(value, na.rm = T),2) ) %>%
+  
+  gather("variable", "value", -n.cars, -kw.piek, -sd) %>%
+  mutate(kw.piek = as.factor(kw.piek)) %>%
+  ggplot(aes(n.cars, y = value, col = kw.piek ) ) +
+  geom_line()  + 
+  facet_wrap(~variable, ncol = 2, scale = "free") +
+  labs(title = paste("gem. piekvraag per aantal t.o.v. maximaal laadvermogen ",
+                     subtitle = "value = sum.netbelasting / aantal.aauto's", sep = " ") ) 
+
+```
+
+```{r}
+
+m.c %>% 
+  mutate( value = kw.sum.piek ) %>%
+  group_by(n.cars, kw.piek) %>%
+  summarise(
+    quant99 = quantile(value, 0.99),
+    max = max(value),
+    mean = round(mean(value),2),
+    sd = round(sd(value, na.rm = T),2) ) %>%
+  
+  gather("variable", "value", -n.cars, -kw.piek, -sd) %>%
+  mutate(kw.piek = as.factor(kw.piek)) %>%
+  ggplot(aes(n.cars, y = value, col = kw.piek ) ) +
+  geom_line()  + 
+  facet_wrap(~variable, ncol = 2, scale = "free") +
+  labs(title = paste("gem. piekvraag per aantal t.o.v. maximaal laadvermogen ",
+                     subtitle = "value = sum.netbelasting ", sep = " ") ) 
+
+```
+
