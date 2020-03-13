@@ -19,7 +19,7 @@ LoadPackages <- function(pkg){
 }
 
 LoadPackages(c( "readxl","dplyr", "tidyr", "ggplot2", "pbapply", "parallel" ))
-
+files <- './Elaad/'
 n.c <- detectCores()
 ```
 
@@ -31,28 +31,28 @@ https://platform.elaad.io/analyses/ElaadNL_opendata_2018_11.php
 arrival <- 
   bind_rows(
     # weekday
-    read_excel('../data/modeldata/manual/Elaad/arrival.weekday.xlsx') %>%
+    read_excel(paste0(files, 'arrival.weekday.xlsx') ) %>%
       rename(arrival.time = 'Arrival time') %>% 
       gather("type", "arival.prob", -arrival.time) %>%
       mutate( weekday = T,
               hour = as.numeric(format(arrival.time, "%H")) +1 ),
     # weekends
-    read_excel('../data/modeldata/manual/Elaad/arrival.weekend.xlsx') %>%
+    read_excel(paste0(files, 'arrival.weekend.xlsx')) %>%
       rename(arrival.time = 'Arrival time') %>% 
       gather("type", "arival.prob", -arrival.time) %>%
       mutate( weekday = F,
               hour = as.numeric(format(arrival.time, "%H")) +1 )) %>%
   select(-arrival.time)
 
-demand <- read_excel('../data/modeldata/manual/Elaad/demand.xlsx') %>%
+demand <- read_excel(paste0(files, 'demand.xlsx')) %>%
   rename(kWh = "Energy demand per charging event (kWh)") %>%
   gather("type", "value", -kWh) %>% mutate(value = as.numeric(value))
 
-duration <-  read_excel('../data/modeldata/manual/Elaad/duration.xlsx') %>%
+duration <-  read_excel(paste0(files, 'duration.xlsx') ) %>%
   rename(time = "Connection duration per charging event (hours)") %>%
   gather("type", "value", -time) %>% mutate(value = as.numeric(value))
 
-piek <- read_excel('../data/modeldata/manual/Elaad/piek.xlsx') %>%
+piek <- read_excel(paste0(files, 'piek.xlsx') ) %>%
   rename(prec = "Percentage of charging events") %>%
   gather("type", "piek.prob", -prec) %>% mutate(piek.prob = as.numeric(piek.prob)) %>%
   filter(type == max(type))
@@ -240,7 +240,7 @@ for (n.car in aantal.auto){
 
 # Monte carlo
 ```{r monte carlo piekvraag}
-aantal.simulatie <- 100^3
+aantal.simulatie <- 10^4
 aantal.auto <-  floor(10^(0.2*1:10) )
 laad.piek <- floor(seq(2, 30, length.out = 7))
 charging.point.type <- "Private"
